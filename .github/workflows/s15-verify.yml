@@ -1,0 +1,72 @@
+name: s15-verify
+
+on:
+  push:
+    branches:
+      - "s15ci/**"
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - name: Which tree is under test
+        run: git log -3 --format='%H %T %s'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install
+        run: |
+          pip install --upgrade uv
+          uv venv
+          uv pip install ".[quality,typing,testing]"
+      - run: .venv/bin/ruff check tests src
+      - run: .venv/bin/ruff format --check tests src
+      - run: .venv/bin/python utils/check_static_imports.py
+      - run: .venv/bin/python utils/check_all_variable.py
+      - run: .venv/bin/mypy src
+
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - name: Which tree is under test
+        run: git log -3 --format='%H %T %s'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          pip install --upgrade uv
+          uv venv
+          uv pip install ".[testing]" pytest-timeout
+      - name: New and changed tests (offline, mocked Hub)
+        run: >
+          .venv/bin/python -m pytest tests/test_hf_file_system.py -p no:cacheprovider -rA
+          -k "no_duplicates or refresh_replaces or bucket_info_refresh or listing_a_bucket_file"
+      - name: Offline part of tests/test_hf_file_system.py (the TestHfFileSystem* classes need the staging Hub)
+        run: >
+          .venv/bin/python -m pytest tests/test_hf_file_system.py -p no:cacheprovider -rfE --timeout=120
+          -k "not TestHfFileSystem" --deselect tests/test_hf_file_system.py::test_exists_after_repo_deletion
+      - name: Offline utils and cache tests
+        run: >
+          .venv/bin/python -m pytest tests/test_utils_paths.py tests/test_utils_hf_uris.py tests/test_utils_parsing.py
+          tests/test_utils_validators.py tests/test_utils_datetime.py tests/test_utils_chunks.py tests/test_utils_headers.py
+          tests/test_utils_sha.py tests/test_utils_dotenv.py tests/test_utils_tqdm.py tests/test_utils_pagination.py
+          tests/test_utils_deprecation.py tests/test_utils_errors.py tests/test_utils_fixes.py tests/test_utils_typing.py
+          tests/test_utils_strict_dataclass.py tests/test_local_folder.py tests/test_tree_cache.py
+          tests/test_init_lazy_loading.py tests/test_cache_layout.py tests/test_cache_no_symlinks.py
+          -p no:cacheprovider -rfE --timeout=120
