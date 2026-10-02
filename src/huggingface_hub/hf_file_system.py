@@ -613,6 +613,9 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
                     revision=resolved_path.revision,
                     repo_type=resolved_path.repo_type,
                 )
+            # Entries are first collected per directory and only then written to the cache, so that a fresh listing
+            # replaces (instead of extending) what was cached before for these directories.
+            listed_dirs: dict[str, list[dict[str, Any]]] = {}
             for path_info in tree:
                 cache_path = root_path + "/" + path_info.path
                 if isinstance(path_info, RepoFile):
@@ -650,11 +653,22 @@ class HfFileSystem(fsspec.AbstractFileSystem, metaclass=_Cached):  # ty: ignore[
                         "type": "directory",
                         "uploaded_at": path_info.uploaded_at,
                     }
-                parent_path = self._parent(cache_path_info["name"])
-                self.dircache.setdefault(parent_path, []).append(cache_path_info)
+                # Listing a bucket file returns the file itself (the server matches prefixes lexically). It is not
+                # a listing of its parent directory, so it must not be cached as such.
+                if cache_path != path:
+                    listed_dirs.setdefault(self._parent(cache_path), []).append(cache_path_info)
                 depth = cache_path[len(path) :].count("/")
                 if maxdepth is None or depth <= maxdepth:
                     out.append(cache_path_info)
+            # Drop what was cached for `path` (and for the directories below it when listing recursively) before
+            # caching the fresh listing, otherwise listing a sub-directory first or using `refresh=True` leaves
+            # duplicated entries in the cache.
+            self.dircache.pop(path, None)
+            if recursive:
+                for cached_path in list(self.dircache):
+                    if cached_path.startswith(path + "/"):
+                        self.dircache.pop(cached_path, None)
+            self.dircache.update(listed_dirs)
         return out
 
     def _list_bucket_tree_with_folders(

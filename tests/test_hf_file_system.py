@@ -14,7 +14,9 @@ import fsspec
 import pytest
 
 from huggingface_hub import HfApi, constants, hf_file_system
+from huggingface_hub._buckets import BucketFile, BucketFolder
 from huggingface_hub.errors import BucketNotFoundError, RepositoryNotFoundError, RevisionNotFoundError
+from huggingface_hub.hf_api import RepoFile, RepoFolder
 from huggingface_hub.hf_file_system import (
     HfFileSystem,
     HfFileSystemFile,
@@ -869,6 +871,139 @@ def test_resolve_path_with_non_matching_revisions():
     fs = HfFileSystem()
     with pytest.raises(ValueError):
         fs.resolve_path("username/my_model@dev", revision="main")
+
+
+def _mock_repo_tree(fs: HfFileSystem, files: dict[str, int]):
+    """Patch `list_repo_tree` and `repo_info` to serve an in-memory repo (`files` maps file paths to sizes)."""
+
+    def _list_repo_tree(repo_id: str, path_in_repo: Optional[str] = None, *, recursive: bool = False, **kwargs):
+        prefix = f"{path_in_repo.strip('/')}/" if path_in_repo else ""
+        folders = set()
+        for path in sorted(files):
+            if not path.startswith(prefix):
+                continue
+            parts = path[len(prefix) :].split("/")
+            for depth in range(1, len(parts) if recursive else min(2, len(parts))):
+                folder = prefix + "/".join(parts[:depth])
+                if folder not in folders:
+                    folders.add(folder)
+                    yield RepoFolder(path=folder, oid="a" * 40)
+            if recursive or len(parts) == 1:
+                yield RepoFile(path=path, size=files[path], oid="b" * 40)
+
+    return patch.multiple(
+        fs._api,
+        list_repo_tree=_list_repo_tree,
+        repo_info=lambda *args, **kwargs: None,
+    )
+
+
+def test_ls_after_recursive_listing_has_no_duplicates():
+    fs = HfFileSystem(skip_instance_cache=True)
+    root = "datasets/username/my_dataset"
+    with _mock_repo_tree(fs, {"a.txt": 1, "data/x.txt": 2, "data/y.txt": 3}):
+        expected = fs.ls(f"{root}/data", detail=False)
+        assert expected == [f"{root}/data/x.txt", f"{root}/data/y.txt"]
+
+        # Listing the parent recursively lists "data" again: the cache must be replaced, not extended
+        assert fs.find(root) == [f"{root}/a.txt", f"{root}/data/x.txt", f"{root}/data/y.txt"]
+
+        assert fs.ls(f"{root}/data", detail=False) == expected
+        assert list(fs.walk(f"{root}/data")) == [(f"{root}/data", [], ["x.txt", "y.txt"])]
+        assert [info["name"] for info in fs.dircache[f"{root}/data"]] == expected
+
+
+def test_ls_refresh_replaces_cached_listing():
+    fs = HfFileSystem(skip_instance_cache=True)
+    root = "datasets/username/my_dataset"
+    files = {"a.txt": 1, "b.txt": 2}
+    with _mock_repo_tree(fs, files):
+        assert fs.ls(root, detail=False) == [f"{root}/a.txt", f"{root}/b.txt"]
+
+        files["c.txt"] = 3
+        assert fs.ls(root, detail=False) == [f"{root}/a.txt", f"{root}/b.txt"]  # still cached
+        assert fs.ls(root, detail=False, refresh=True) == [f"{root}/a.txt", f"{root}/b.txt", f"{root}/c.txt"]
+        assert fs.ls(root, detail=False) == [f"{root}/a.txt", f"{root}/b.txt", f"{root}/c.txt"]
+
+        del files["a.txt"]
+        assert fs.ls(root, detail=False, refresh=True) == [f"{root}/b.txt", f"{root}/c.txt"]
+        assert fs.ls(root, detail=False) == [f"{root}/b.txt", f"{root}/c.txt"]
+
+
+def _mock_bucket_tree(fs: HfFileSystem, files: dict[str, int]):
+    """Patch `list_bucket_tree` and `bucket_info` to serve an in-memory bucket (`files` maps file paths to sizes).
+
+    Like the server, a prefix is matched lexically (the file `prefix` itself is returned if it exists).
+    """
+
+    def _file(path: str) -> BucketFile:
+        return BucketFile(type="file", path=path, size=files[path], xetHash="a" * 64)
+
+    def _list_bucket_tree(bucket_id: str, prefix: Optional[str] = None, *, recursive: bool = False, **kwargs):
+        prefix = prefix or ""
+        folders = set()
+        for path in sorted(files):
+            if not path.startswith(prefix):
+                continue
+            if recursive or path == prefix:
+                yield _file(path)
+                continue
+            base = f"{prefix}/" if prefix else ""
+            if not path.startswith(base):
+                continue
+            rest = path[len(base) :]
+            if "/" in rest:
+                folder = base + rest.split("/", 1)[0]
+                if folder not in folders:
+                    folders.add(folder)
+                    yield BucketFolder(type="directory", path=folder)
+            else:
+                yield _file(path)
+
+    return patch.multiple(fs._api, list_bucket_tree=_list_bucket_tree, bucket_info=lambda *args, **kwargs: None)
+
+
+def test_bucket_info_refresh_returns_fresh_file_info():
+    fs = HfFileSystem(skip_instance_cache=True)
+    path = "buckets/username/my_bucket/data/x.txt"
+    files = {"data/x.txt": 2, "data/y.txt": 3}
+    with _mock_bucket_tree(fs, files):
+        assert fs.info(path)["size"] == 2
+
+        files["data/x.txt"] = 999
+        assert fs.info(path)["size"] == 2  # cached
+        assert fs.info(path, refresh=True)["size"] == 999
+        assert fs.info(path)["size"] == 999
+
+        del files["data/x.txt"]
+        with pytest.raises(FileNotFoundError):
+            fs.info(path, refresh=True)
+        assert fs.ls("buckets/username/my_bucket/data", detail=False) == ["buckets/username/my_bucket/data/y.txt"]
+
+
+def test_listing_a_bucket_file_does_not_replace_the_listing_of_its_directory():
+    fs = HfFileSystem(skip_instance_cache=True)
+    root = "buckets/username/my_bucket"
+    files = {"data/x.txt": 1, "data/y.txt": 2, "data/z.txt": 3}
+    with _mock_bucket_tree(fs, files):
+        # The tree endpoint returns the file itself when the prefix is a file: only this file is listed
+        assert fs.ls(f"{root}/data/x.txt", detail=False) == [f"{root}/data/x.txt"]
+        assert fs.find(f"{root}/data/x.txt") == [f"{root}/data/x.txt"]
+
+        assert fs.exists(f"{root}/data/y.txt")
+        assert fs.ls(f"{root}/data", detail=False) == [
+            f"{root}/data/x.txt",
+            f"{root}/data/y.txt",
+            f"{root}/data/z.txt",
+        ]
+
+        # ... and the same when the directory is already cached
+        assert fs.ls(f"{root}/data/x.txt", detail=False) == [f"{root}/data/x.txt"]
+        assert fs.ls(f"{root}/data", detail=False) == [
+            f"{root}/data/x.txt",
+            f"{root}/data/y.txt",
+            f"{root}/data/z.txt",
+        ]
 
 
 def test_stream_file_open_if_not_found():
